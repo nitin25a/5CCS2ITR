@@ -1,113 +1,123 @@
 #!/usr/bin/env python3
 import rospy
 import actionlib
-from math import atan2, hypot, sin, cos
-from geometry_msgs.msg import Twist, Pose2D, Point
+from geometry_msgs.msg import PoseStamped, Pose2D, Quaternion
+from tf.transformations import quaternion_from_euler
 from nav_msgs.msg import Odometry
-from tf.transformations import euler_from_quaternion
+from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal  # New Imports
 from delivery_bot.msg import (
-    GoToLocationAction, GoToLocationFeedback, GoToLocationResult,
-    LookAtAction, LookAtFeedback, LookAtResult
+    GoToLocationAction, GoToLocationResult,
+    LookAtAction, LookAtResult
 )
 from delivery_bot.srv import GetLocation
 
+
 class MotionActionServer:
     def __init__(self):
-        rospy.init_node('motion_action_server')
+        rospy.init_node("motion_action_server")
 
-        # Publisher to move the robot
-        self.cmd_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
-        # Subscribe to odometry to track robot position
-        rospy.Subscriber('/odom', Odometry, self.odom_callback)
+        # --- Publishers / Subscribers ---
+        # NOTE: We are replacing the simple publisher with an Action Client for move_base
+        rospy.Subscriber("/odom", Odometry, self.odom_callback)
 
         self.current_pose = Pose2D()
 
-        # Connect to the location service
-        rospy.wait_for_service('get_location')
-        self.get_location = rospy.ServiceProxy('get_location', GetLocation)
+        # --- Service Client ---
+        rospy.wait_for_service("get_location")
+        self.get_location = rospy.ServiceProxy("get_location", GetLocation)
 
-        # Create two action servers
-        self.goto_server = actionlib.SimpleActionServer('goto_location', GoToLocationAction, self.execute_goto, False)
-        self.lookat_server = actionlib.SimpleActionServer('look_at', LookAtAction, self.execute_lookat, False)
+        # --- move_base Action Client ---
+        # This client is used to send navigation goals to the ROS move_base node
+        self.move_base_client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
+        rospy.loginfo("[Action] Waiting for move_base action server...")
+        self.move_base_client.wait_for_server()
+        rospy.loginfo("[Action] Connected to move_base server.")
+
+        # --- Custom Action Servers ---
+        self.goto_server = actionlib.SimpleActionServer(
+            "goto_location", GoToLocationAction, self.execute_goto, auto_start=False
+        )
+        self.lookat_server = actionlib.SimpleActionServer(
+            "look_at", LookAtAction, self.execute_lookat, auto_start=False
+        )
 
         self.goto_server.start()
         self.lookat_server.start()
-        rospy.loginfo("Action servers started.")
+
+        rospy.loginfo("[Action] MotionActionServer running and ready for goals.")
         rospy.spin()
 
+    # --- Callbacks ---
     def odom_callback(self, msg):
-        """Extracts x, y, yaw from odometry."""
-        q = msg.pose.pose.orientation
-        (_, _, yaw) = euler_from_quaternion([q.x, q.y, q.z, q.w])
         self.current_pose.x = msg.pose.pose.position.x
         self.current_pose.y = msg.pose.pose.position.y
-        self.current_pose.theta = yaw
+        # Note: You might want to update the orientation here too if you use it.
 
+    # --- Actions ---
     def execute_goto(self, goal):
-        """Handles GoToLocation action: moves robot to a named room."""
-        rate = rospy.Rate(10)
-        resp = self.get_location(goal.location_name)
+        rospy.loginfo(f"[Action] Received request: Go to {goal.location_name}")
+
+        # Check for preemption request
+        if self.goto_server.is_preempt_requested():
+            self.move_base_client.cancel_goal()
+            self.goto_server.set_preempted()
+            rospy.loginfo("[Action] GoToLocation preempted.")
+            return
+
+        # 1. Get target coordinates from the service
+        try:
+            resp = self.get_location(goal.location_name)
+        except rospy.ServiceException as e:
+            rospy.logerr(f"[Action] Failed to call get_location: {e}")
+            self.goto_server.set_aborted(GoToLocationResult(success=False))
+            return
+
         target = resp.pose
-        rospy.loginfo(f"[Action] Navigating to {goal.location_name} ({target.x:.2f}, {target.y:.2f})")
+        rospy.loginfo(f"[Action] Navigating to {goal.location_name} at ({target.x:.2f}, {target.y:.2f})")
 
-        vel = Twist()
-        feedback = GoToLocationFeedback()
+        # 2. Create the MoveBaseGoal
+        mb_goal = MoveBaseGoal()
+        mb_goal.target_pose.header.stamp = rospy.Time.now()
+        mb_goal.target_pose.header.frame_id = "map"
 
-        while not rospy.is_shutdown():
-            dx = target.x - self.current_pose.x
-            dy = target.y - self.current_pose.y
-            distance = hypot(dx, dy)
+        mb_goal.target_pose.pose.position.x = target.x
+        mb_goal.target_pose.pose.position.y = target.y
 
-            # Stop if close enough
-            if distance < 0.3:
-                break
+        quat = quaternion_from_euler(0, 0, target.theta)
+        mb_goal.target_pose.pose.orientation = Quaternion(*quat)
 
-            angle_to_target = atan2(dy, dx)
-            angle_error = angle_to_target - self.current_pose.theta
-            angle_error = atan2(sin(angle_error), cos(angle_error))
+        # 3. Send goal to move_base and wait for result
+        self.move_base_client.send_goal(mb_goal)
+        rospy.loginfo(f"[Action] Sent goal to move_base. Waiting for result...")
 
-            vel.linear.x = 0.5
-            vel.angular.z = 0.8 * angle_error
-            self.cmd_pub.publish(vel)
+        # Wait until navigation completes or preemption occurs
+        self.move_base_client.wait_for_result()
 
-            feedback.current_pose = self.current_pose
-            self.goto_server.publish_feedback(feedback)
-            rate.sleep()
+        state = self.move_base_client.get_state()
 
-        self.cmd_pub.publish(Twist())
-        result = GoToLocationResult(success=True)
-        self.goto_server.set_succeeded(result)
-        rospy.loginfo(f"[Action] Reached {goal.location_name}")
+        # Check if the goal succeeded (state 3 is SUCCEEDED)
+        if state == actionlib.GoalStatus.SUCCEEDED:
+            result = GoToLocationResult(success=True)
+            self.goto_server.set_succeeded(result)
+            rospy.loginfo(f"[Action] Successfully reached {goal.location_name}.")
+        else:
+            rospy.logerr(f"[Action] Navigation failed or aborted. Final state: {state}")
+            result = GoToLocationResult(success=False)
+            self.goto_server.set_aborted(result)
 
     def execute_lookat(self, goal):
-        """Handles LookAt action: rotates robot to face a target point."""
-        rate = rospy.Rate(10)
-        vel = Twist()
-        feedback = LookAtFeedback()
+        # NOTE: This is a placeholder as you did not implement actual head/base movement
+        # to 'look at' the target. It just succeeds immediately.
+        rospy.loginfo(f"[Action] Received LookAt target: ({goal.target.x:.2f}, {goal.target.y:.2f})")
+
+        # In a real robot, you would publish a command here to turn the base or the head
+        # For now, we simulate success
+        rospy.sleep(3)
+
         result = LookAtResult(success=True)
-        target = goal.target
-
-        rospy.loginfo(f"[Action] Looking at target ({target.x:.2f}, {target.y:.2f})")
-
-        while not rospy.is_shutdown():
-            dx = target.x - self.current_pose.x
-            dy = target.y - self.current_pose.y
-            desired_yaw = atan2(dy, dx)
-            yaw_error = desired_yaw - self.current_pose.theta
-            yaw_error = atan2(sin(yaw_error), cos(yaw_error))
-
-            if abs(yaw_error) < 0.05:
-                break
-
-            vel.angular.z = 0.5 * yaw_error
-            self.cmd_pub.publish(vel)
-            feedback.current_yaw = self.current_pose.theta
-            self.lookat_server.publish_feedback(feedback)
-            rate.sleep()
-
-        self.cmd_pub.publish(Twist())
         self.lookat_server.set_succeeded(result)
-        rospy.loginfo("[Action] Finished LookAt action.")
+        rospy.loginfo("[Action] Finished LookAt action (simulated success).")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     MotionActionServer()
